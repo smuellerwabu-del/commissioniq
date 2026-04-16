@@ -615,6 +615,56 @@ const DB = {
   saveCompany(data) {
     try { localStorage.setItem('ciq_company', JSON.stringify(data)); return true; } catch{ return false; }
   },
+
+  // ── MEETINGS (Supabase project_data JSONB fallback) ───────────────────────
+  // Stored in projects.project_data JSONB column under key "meetings_{projectId}"
+  // Falls back to localStorage if Supabase not available
+  async getMeetings(projectId) {
+    if(!sb) return JSON.parse(localStorage.getItem(`mtg_${projectId}`)||'[]');
+    try {
+      const {data} = await sb.from('project_data').select('value').eq('project_id',projectId).eq('key','meetings').single();
+      return data?.value||JSON.parse(localStorage.getItem(`mtg_${projectId}`)||'[]');
+    } catch { return JSON.parse(localStorage.getItem(`mtg_${projectId}`)||'[]'); }
+  },
+  async saveMeetings(projectId, meetings) {
+    try { localStorage.setItem(`mtg_${projectId}`, JSON.stringify(meetings)); } catch{}
+    if(!sb) return;
+    try {
+      await sb.from('project_data').upsert({project_id:projectId,key:'meetings',value:meetings},{onConflict:'project_id,key'});
+    } catch(e){ console.warn('Meetings save to DB failed, using localStorage:', e); }
+  },
+
+  // ── SUBMITTALS ────────────────────────────────────────────────────────────
+  async getSubmittals(projectId) {
+    if(!sb) return JSON.parse(localStorage.getItem(`sub_${projectId}`)||'[]');
+    try {
+      const {data} = await sb.from('project_data').select('value').eq('project_id',projectId).eq('key','submittals').single();
+      return data?.value||JSON.parse(localStorage.getItem(`sub_${projectId}`)||'[]');
+    } catch { return JSON.parse(localStorage.getItem(`sub_${projectId}`)||'[]'); }
+  },
+  async saveSubmittals(projectId, submittals) {
+    try { localStorage.setItem(`sub_${projectId}`, JSON.stringify(submittals)); } catch{}
+    if(!sb) return;
+    try {
+      await sb.from('project_data').upsert({project_id:projectId,key:'submittals',value:submittals},{onConflict:'project_id,key'});
+    } catch(e){ console.warn('Submittals save to DB failed:', e); }
+  },
+
+  // ── TAB REPORT ────────────────────────────────────────────────────────────
+  async getTAB(projectId) {
+    if(!sb) return null;
+    try {
+      const {data} = await sb.from('project_data').select('value').eq('project_id',projectId).eq('key','tab').single();
+      return data?.value||null;
+    } catch { return null; }
+  },
+  async saveTAB(projectId, tabData) {
+    try { localStorage.setItem(`tab_${projectId}`, JSON.stringify(tabData)); } catch{}
+    if(!sb) return;
+    try {
+      await sb.from('project_data').upsert({project_id:projectId,key:'tab',value:tabData},{onConflict:'project_id,key'});
+    } catch(e){ console.warn('TAB save to DB failed:', e); }
+  },
 };
 
 // ── AI ANALYSIS ───────────────────────────────────────────────────────────────
@@ -1322,9 +1372,117 @@ function AddPunchModal({onAdd,onClose,t,busy}){
   );
 }
 
+// ── FIELD → TEST MAPPING ─────────────────────────────────────────────────────
+// Maps common AI-extracted field names to discipline + level + description hints
+function guessTestFromField(field, value) {
+  const f = (field||'').toLowerCase();
+  const v = String(value||'');
+  if(f.includes('umschalt') || f.includes('transfer'))
+    return { discipline:'electrical', level:4, desc:'UPS – static bypass transfer test', expected:v, notes:'Transfer time per extracted submittal value.' };
+  if(f.includes('kapazität') || f.includes('capacity') || f.includes('kva'))
+    return { discipline:'electrical', level:4, desc:'UPS – battery capacity test', expected:v, notes:'Rated capacity per submittal.' };
+  if(f.includes('laufzeit') || f.includes('runtime') || f.includes('laufzeit'))
+    return { discipline:'electrical', level:4, desc:'UPS – battery runtime test', expected:v, notes:'Runtime at full load per submittal.' };
+  if(f.includes('wirkungsgrad') || f.includes('efficiency'))
+    return { discipline:'electrical', level:4, desc:'UPS – efficiency verification', expected:v, notes:'Efficiency per submittal specification.' };
+  if(f.includes('eingangsspannung') || f.includes('voltage') || f.includes('spannung'))
+    return { discipline:'electrical', level:3, desc:'Input voltage verification', expected:v, notes:'Per submittal / nameplate.' };
+  if(f.includes('pue'))
+    return { discipline:'mechanical', level:4, desc:'PUE measurement at design load', expected:v, notes:'PUE target per design documents.' };
+  if(f.includes('temperatur') || f.includes('temperature') || f.includes('temp'))
+    return { discipline:'mechanical', level:4, desc:'Server inlet temperature measurement', expected:v, notes:'Per ASHRAE TC 9.9 / submittal.' };
+  if(f.includes('cfm') || f.includes('airflow') || f.includes('luftmenge'))
+    return { discipline:'mechanical', level:4, desc:'CRAC airflow volume measurement (TAB)', expected:v, notes:'Per submittal specification. NEBB ±10%.' };
+  if(f.includes('gpm') || f.includes('flow') || f.includes('durchfluss'))
+    return { discipline:'mechanical', level:4, desc:'Chilled water flow rate (TAB)', expected:v, notes:'Per submittal. NEBB ±10%.' };
+  if(f.includes('leistung') || f.includes('kw') || f.includes('power'))
+    return { discipline:'electrical', level:4, desc:'Power measurement', expected:v, notes:'Per submittal specification.' };
+  // default
+  return { discipline:'electrical', level:4, desc:`${field} – verification`, expected:v, notes:'Extracted from equipment submittal.' };
+}
+
+// ── USE AS TEST MODAL ─────────────────────────────────────────────────────────
+function UseAsTestModal({value, project, onAdd, onClose, t, user}) {
+  const guess = guessTestFromField(value.field, value.value);
+  const [lv, setLv]     = useState(guess.level);
+  const [disc, setDisc] = useState(guess.discipline);
+  const [desc, setDesc] = useState(guess.desc);
+  const [equip, setEquip] = useState('');
+  const [exp, setExp]   = useState(guess.expected);
+  const [notes, setNotes] = useState(guess.notes);
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    setBusy(true);
+    const px={electrical:"E",mechanical:"M",fireSuppression:"F",itInfra:"I"}[disc]||"T";
+    const lx={0:"D",1:"FAT",2:"DEL",3:"PRE",4:"",5:"IST",6:"HO"}[lv]||"";
+    const n = Math.floor(Math.random()*900)+100;
+    const testId = `${lx}${px}-${String(n).padStart(3,"0")}`;
+    await onAdd({
+      id:testId, level:lv, discipline:disc, equipment:equip,
+      description:desc, expected:exp, measured:'PENDING', result:'pending',
+      notes, technician:user.email.split('@')[0], levelData:{}
+    });
+    setBusy(false);
+    onClose();
+  }
+
+  return (
+    <div className="modal-ov">
+      <div className="modal" style={{width:560}}>
+        <div className="modal-title">→ Als Test-Sollwert übernehmen</div>
+
+        {/* Source value info */}
+        <div style={{padding:"10px 14px",background:"var(--blue-bg)",border:"1px solid rgba(42,95,165,.2)",borderRadius:8,marginBottom:20,fontSize:12}}>
+          <div style={{fontFamily:"var(--fm)",fontSize:10,color:"var(--blue)",letterSpacing:".5px",textTransform:"uppercase",marginBottom:4}}>Aus KI-Analyse übernommen</div>
+          <div style={{display:"flex",gap:16,alignItems:"center"}}>
+            <span style={{color:"var(--ink3)",fontFamily:"var(--fm)",fontSize:11,width:140,flexShrink:0}}>{value.field}</span>
+            <span style={{fontFamily:"var(--fm)",fontSize:13,fontWeight:600,color:"var(--ink)"}}>{value.value}</span>
+            <span style={{fontFamily:"var(--fm)",fontSize:11,color:"var(--ink3)"}}>{Math.round(value.confidence*100)}% Konfidenz</span>
+          </div>
+        </div>
+
+        <div className="g2" style={{marginBottom:0}}>
+          <div className="field"><label className="lbl">Level</label>
+            <select className="inp" value={lv} onChange={e=>setLv(Number(e.target.value))}>
+              {CX_LEVELS.map(l=><option key={l.id} value={l.id}>L{l.id} – {l.short}</option>)}
+            </select></div>
+          <div className="field"><label className="lbl">Disziplin</label>
+            <select className="inp" value={disc} onChange={e=>setDisc(e.target.value)}>
+              {(project.disciplines||DISCS).map(d=><option key={d} value={d}>{DI[d]} {d}</option>)}
+            </select></div>
+        </div>
+
+        <div className="field"><label className="lbl">Testbeschreibung</label>
+          <input className="inp" value={desc} onChange={e=>setDesc(e.target.value)}/></div>
+
+        <div className="g2">
+          <div className="field"><label className="lbl">Equipment-ID</label>
+            <input className="inp" value={equip} onChange={e=>setEquip(e.target.value)} placeholder={t.equipmentPh}/></div>
+          <div className="field"><label className="lbl">Sollwert (Expected)</label>
+            <input className="inp" value={exp} onChange={e=>setExp(e.target.value)}/></div>
+        </div>
+
+        <div className="field"><label className="lbl">Beobachtungen / Herkunft</label>
+          <textarea className="inp" rows={2} value={notes} onChange={e=>setNotes(e.target.value)}
+            style={{resize:"vertical",lineHeight:1.5}}/></div>
+
+        <div className="modal-foot">
+          <button className="btn btn-o" onClick={onClose}>{t.cancel}</button>
+          <button className="btn btn-p" onClick={submit} disabled={!desc||busy}>
+            {busy?t.saving:"✓ Test anlegen"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── DOCUMENTS TAB ─────────────────────────────────────────────────────────────
-function DocsTab({project,docs,setDocs,t,lang,user}){
-  const [analyzing,setAnalyzing]=useState(null);const ref=useRef();
+function DocsTab({project,docs,setDocs,t,lang,user,onAddTest}){
+  const [analyzing,setAnalyzing]=useState(null);
+  const [useAsTest,setUseAsTest]=useState(null); // {value, docId}
+  const ref=useRef();
 
   async function deleteDoc(doc) {
     if(!window.confirm(`Remove "${doc.file_name||doc.name}"?`)) return;
@@ -1429,6 +1587,7 @@ function DocsTab({project,docs,setDocs,t,lang,user}){
                     <div style={{display:"flex",gap:4,marginLeft:4}}>
                       {!v.rejected&&<button className={`btn btn-sm ${v.accepted?"btn-g":"btn-p"}`} onClick={()=>acc(doc.id,i)} disabled={v.accepted}>{v.accepted?"✓":t.accept}</button>}
                       {!v.accepted&&!v.rejected&&<button className="btn btn-sm btn-d" onClick={()=>rej(doc.id,i)}>{t.reject}</button>}
+                      {v.plausibility!=="error"&&<button className="btn btn-sm btn-o" style={{fontSize:11,padding:"4px 8px"}} onClick={()=>setUseAsTest({value:v,docId:doc.id})} title="Als Test-Sollwert übernehmen">→ Test</button>}
                     </div>
                   </div>
                 ))}
@@ -1439,6 +1598,12 @@ function DocsTab({project,docs,setDocs,t,lang,user}){
         ))}
         {!docs.length&&<div className="empty" style={{paddingTop:28}}><div className="empty-i">📁</div><p>No documents uploaded yet</p></div>}
       </div>
+      {useAsTest&&<UseAsTestModal
+        value={useAsTest.value}
+        project={project}
+        onAdd={async(testData)=>{if(onAddTest) await onAddTest(testData);}}
+        onClose={()=>setUseAsTest(null)}
+        t={t} user={user}/>}
     </div>
   );
 }
@@ -1550,9 +1715,19 @@ function TeamTab({project, user, toast, lang}) {
             {adding?"…":"+ Add"}
           </button>
         </div>
-        <div style={{marginTop:10,fontSize:11,color:"var(--ink3)",fontFamily:"var(--fm)"}}>
-          The user must have signed in to CommissionIQ at least once before being added.
-          They will receive an email notification when added.
+        <div style={{marginTop:12,padding:"10px 14px",background:"var(--blue-bg)",border:"1px solid rgba(42,95,165,.15)",borderRadius:8,fontSize:12,lineHeight:1.8}}>
+          <div style={{fontWeight:600,fontFamily:"var(--fm)",fontSize:10,color:"var(--blue)",textTransform:"uppercase",letterSpacing:".5px",marginBottom:6}}>
+            📋 Neuen Techniker anlegen – 3 Schritte
+          </div>
+          <div style={{color:"var(--ink2)"}}>
+            <strong>1.</strong> Supabase → Authentication → Users → <strong>"Invite user"</strong> → E-Mail eingeben<br/>
+            <strong>2.</strong> Techniker öffnet Einladungs-E-Mail, setzt Passwort, loggt sich einmal ein<br/>
+            <strong>3.</strong> E-Mail oben eingeben, Rolle wählen → <strong>"+ Add"</strong> klicken
+          </div>
+          <div style={{marginTop:6,fontSize:11,color:"var(--ink3)",fontFamily:"var(--fm)"}}>
+            Der Nutzer muss sich mindestens einmal eingeloggt haben bevor er hinzugefügt werden kann.
+            Nach dem Hinzufügen erhält er eine E-Mail-Benachrichtigung.
+          </div>
         </div>
       </div>
     </div>
@@ -1777,7 +1952,6 @@ function deviationClass(dev) {
 
 function TABReport({project, lang, user, toast, company={}}){
   const t = TR[lang];
-  const storageKey = `tab_${project.id}`;
 
   const [airRows, setAirRows] = useState([EMPTY_AIR_ROW()]);
   const [waterRows, setWaterRows] = useState([EMPTY_WATER_ROW()]);
@@ -1787,13 +1961,12 @@ function TABReport({project, lang, user, toast, company={}}){
   const [conditions, setConditions] = useState("");
   const [loaded, setLoaded] = useState(false);
 
-  // Load from Supabase project metadata or localStorage fallback
+  // Load from Supabase (with localStorage fallback)
   useEffect(() => {
     if(!project.id) return;
-    try {
-      const saved = localStorage.getItem(storageKey);
-      if(saved) {
-        const d = JSON.parse(saved);
+    DB.getTAB(project.id).then(data => {
+      const d = data || JSON.parse(localStorage.getItem(`tab_${project.id}`)||'null');
+      if(d) {
         if(d.airRows?.length) setAirRows(d.airRows);
         if(d.waterRows?.length) setWaterRows(d.waterRows);
         if(d.tester) setTester(d.tester);
@@ -1801,16 +1974,14 @@ function TABReport({project, lang, user, toast, company={}}){
         if(d.instruments) setInstruments(d.instruments);
         if(d.conditions) setConditions(d.conditions);
       }
-    } catch(e){}
-    setLoaded(true);
+      setLoaded(true);
+    }).catch(()=>setLoaded(true));
   }, [project.id]);
 
-  // Auto-save to localStorage on every change
+  // Auto-save to Supabase + localStorage on every change
   useEffect(() => {
     if(!loaded) return;
-    try {
-      localStorage.setItem(storageKey, JSON.stringify({airRows,waterRows,tester,testDate,instruments,conditions}));
-    } catch(e){}
+    DB.saveTAB(project.id, {airRows,waterRows,tester,testDate,instruments,conditions});
   }, [airRows, waterRows, tester, testDate, instruments, conditions, loaded]);
 
   function updAir(id, field, val) {
@@ -2828,7 +2999,11 @@ function ProjectDetail({project,onBack,t,user,lang,toast,company={}}){
           {showPunch&&<AddPunchModal onAdd={addPunch} onClose={()=>setShowPunch(false)} t={t}/>}
         </div>
       )}
-      {tab==="docs"&&<DocsTab project={project} docs={documents} setDocs={setDocuments} t={t} lang={lang} user={user}/>}
+      {tab==="docs"&&<DocsTab project={project} docs={documents} setDocs={setDocuments} t={t} lang={lang} user={user} onAddTest={async(testData)=>{
+        const saved=await DB.createTest(testData,project.id,user.id);
+        setTests(prev=>[...prev,{...testData,dbId:saved.id,ts:saved.tested_at||saved.created_at}]);
+        toast(`Test "${testData.description.slice(0,40)}" angelegt`);
+      }}/>}
       {tab==="tab"&&<TABReport project={project} lang={lang} user={user} toast={toast} company={company}/>}
       {tab==="submittals"&&<SubmittalRegister project={project} lang={lang} user={user} toast={toast}/>}
       {tab==="meetings"&&<MeetingLog project={project} lang={lang} user={user} toast={toast}/>}
@@ -2925,7 +3100,6 @@ const EMPTY_SUBMITTAL = ()=>({
 
 function SubmittalRegister({project, lang, user, toast}) {
   const t = TR[lang];
-  const key = `sub_${project.id}`;
   const [rows, setRows] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [editId, setEditId] = useState(null);
@@ -2933,13 +3107,15 @@ function SubmittalRegister({project, lang, user, toast}) {
   const [filter, setFilter] = useState("all");
 
   useEffect(()=>{
-    try{ const s=JSON.parse(localStorage.getItem(key)||'[]'); if(s.length) setRows(s); }catch{}
-    setLoaded(true);
+    DB.getSubmittals(project.id).then(data=>{
+      if(data?.length) setRows(data);
+      setLoaded(true);
+    }).catch(()=>setLoaded(true));
   },[project.id]);
 
   useEffect(()=>{
     if(!loaded) return;
-    try{ localStorage.setItem(key, JSON.stringify(rows)); }catch{}
+    DB.saveSubmittals(project.id, rows);
   },[rows, loaded]);
 
   function save(row){ setRows(p=>p.some(r=>r.id===row.id)?p.map(r=>r.id===row.id?row:r):[...p,row]); }
@@ -3159,7 +3335,6 @@ const MEETING_TYPES = {
 
 function MeetingLog({project, lang, user, toast}) {
   const t = TR[lang];
-  const key = `mtg_${project.id}`;
   const [meetings, setMeetings] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
@@ -3167,13 +3342,15 @@ function MeetingLog({project, lang, user, toast}) {
   const [expanded, setExpanded] = useState(null);
 
   useEffect(()=>{
-    try{ const s=JSON.parse(localStorage.getItem(key)||'[]'); if(s.length) setMeetings(s); }catch{}
-    setLoaded(true);
+    DB.getMeetings(project.id).then(data=>{
+      if(data?.length) setMeetings(data);
+      setLoaded(true);
+    }).catch(()=>setLoaded(true));
   },[project.id]);
 
   useEffect(()=>{
     if(!loaded) return;
-    try{ localStorage.setItem(key, JSON.stringify(meetings)); }catch{}
+    DB.saveMeetings(project.id, meetings);
   },[meetings, loaded]);
 
   function save(m){ setMeetings(p=>p.some(x=>x.id===m.id)?p.map(x=>x.id===m.id?m:x):[m,...p].sort((a,b)=>b.date.localeCompare(a.date))); }
