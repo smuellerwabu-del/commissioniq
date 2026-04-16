@@ -1,0 +1,71 @@
+# CommissionIQ – Netlify Configuration
+# Place this file as netlify.toml in the same folder as CommissionIQ.html
+
+[build]
+  publish = "."
+
+# ── SECURITY HEADERS ──────────────────────────────────────────────────────────
+[[headers]]
+  for = "/*"
+  [headers.values]
+
+    # Prevent clickjacking
+    X-Frame-Options = "DENY"
+
+    # Prevent MIME-type sniffing
+    X-Content-Type-Options = "nosniff"
+
+    # Force HTTPS for 1 year
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload"
+
+    # Referrer: only send origin, never full URL
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+    # Permissions: disable unnecessary browser features
+    Permissions-Policy = "camera=(self), microphone=(), geolocation=(), payment=()"
+
+    # Content Security Policy
+    # Allows: self, Supabase, Google Fonts, CDN libraries, Anthropic (via Edge Function only)
+    Content-Security-Policy = """
+      default-src 'self';
+      script-src 'self' 'unsafe-eval'
+        https://cdnjs.cloudflare.com
+        https://cdn.jsdelivr.net
+        https://unpkg.com;
+      style-src 'self' 'unsafe-inline'
+        https://fonts.googleapis.com;
+      font-src 'self'
+        https://fonts.gstatic.com;
+      img-src 'self' data: blob:
+        https://chart.googleapis.com
+        https://*.supabase.co
+        https://*.supabase.in;
+      connect-src 'self'
+        https://*.supabase.co
+        https://*.supabase.in
+        wss://*.supabase.co;
+      frame-src 'none';
+      object-src 'none';
+      base-uri 'self';
+      form-action 'self';
+    """
+
+# ── CACHE CONTROL ─────────────────────────────────────────────────────────────
+# HTML: never cache (always get latest version)
+[[headers]]
+  for = "/*.html"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+# Static assets: cache 1 year
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# ── REDIRECTS: HTTP → HTTPS (Netlify handles this automatically, but explicit is better) ──
+[[redirects]]
+  from = "http://commissioniq.netlify.app/*"
+  to   = "https://commissioniq.netlify.app/:splat"
+  status = 301
+  force  = true
