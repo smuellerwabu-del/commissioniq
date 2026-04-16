@@ -618,17 +618,31 @@ const DB = {
 };
 
 // ── AI ANALYSIS ───────────────────────────────────────────────────────────────
-// Routed through Supabase Edge Function – Anthropic API key never touches the browser
-async function analyzeDoc(fileName, fileType, lang) {
+async function analyzeDoc(fileName, fileType, lang, s3Key) {
   if(!sb) throw new Error('Not configured');
 
-  // Call our secure Edge Function – it holds the Anthropic key server-side
-  const { data, error } = await sb.functions.invoke('commissioniq-analyze', {
-    body: { fileName, fileType, lang }
+  // Get session token explicitly
+  const { data: { session } } = await sb.auth.getSession();
+  if(!session?.access_token) throw new Error('Not authenticated');
+
+  // Use direct fetch instead of sb.functions.invoke to ensure auth header is sent
+  const url = `${SUPABASE_URL}/functions/v1/commissioniq-analyze`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${session.access_token}`,
+      'apikey': SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ fileName, fileType, lang, s3Key }),
   });
 
-  if(error) throw error;
-  return data; // { extractedValues: [...], summary: "..." }
+  if(!res.ok) {
+    const err = await res.text();
+    throw new Error(`Edge function error ${res.status}: ${err}`);
+  }
+
+  return await res.json();
 }
 
 // ── SMALL COMPONENTS ──────────────────────────────────────────────────────────
@@ -1311,6 +1325,31 @@ function AddPunchModal({onAdd,onClose,t,busy}){
 // ── DOCUMENTS TAB ─────────────────────────────────────────────────────────────
 function DocsTab({project,docs,setDocs,t,lang,user}){
   const [analyzing,setAnalyzing]=useState(null);const ref=useRef();
+
+  async function deleteDoc(doc) {
+    if(!window.confirm(`Remove "${doc.file_name||doc.name}"?`)) return;
+    // Remove from Storage
+    if(IS_CONFIGURED && doc.s3_key) {
+      await sb.storage.from('documents').remove([doc.s3_key]);
+      await sb.from('documents').delete().eq('id', doc.id);
+    }
+    setDocs(prev => prev.filter(d => d.id !== doc.id));
+  }
+
+  async function reanalyze(doc) {
+    if(!IS_CONFIGURED) return;
+    setDocs(prev => prev.map(d => d.id===doc.id ? {...d, status:'analyzing', extractedValues:[]} : d));
+    setAnalyzing(doc.id);
+    try {
+      const r = await analyzeDoc(doc.file_name||doc.name, doc.file_type||doc.type, lang, doc.s3_key);
+      await DB.updateDocumentAnalysis(doc.id, r.summary, r.extractedValues||[], project.id, user.id);
+      setDocs(prev => prev.map(d => d.id===doc.id ? {...d, status:'analyzed', extractedValues:r.extractedValues||[], summary:r.summary} : d));
+    } catch(e) {
+      console.error(e);
+      setDocs(prev => prev.map(d => d.id===doc.id ? {...d, status:'analyzed'} : d));
+    }
+    setAnalyzing(null);
+  }
   async function process(file){
     if(!IS_CONFIGURED){
       // Demo mode: simulate analysis
@@ -1330,10 +1369,13 @@ function DocsTab({project,docs,setDocs,t,lang,user}){
       setDocs(prev=>[{...dbDoc,extractedValues:[]},...prev]);
       setAnalyzing(dbDoc.id);
       try{
-        const r=await analyzeDoc(file.name,dbDoc.file_type,lang);
+        const r=await analyzeDoc(file.name,dbDoc.file_type,lang,dbDoc.s3_key);
         await DB.updateDocumentAnalysis(dbDoc.id,r.summary,r.extractedValues||[],project.id,user.id);
         setDocs(prev=>prev.map(d=>d.id===dbDoc.id?{...d,status:"analyzed",extractedValues:r.extractedValues||[],summary:r.summary}:d));
-      }catch{setDocs(prev=>prev.map(d=>d.id===dbDoc.id?{...d,status:"analyzed",extractedValues:[]}:d));}
+      }catch(e){
+        console.error('AI analysis error:',e);
+        setDocs(prev=>prev.map(d=>d.id===dbDoc.id?{...d,status:"analyzed",extractedValues:[]}:d));
+      }
       setAnalyzing(null);
     }catch(e){console.error(e);}
   }
@@ -1370,6 +1412,8 @@ function DocsTab({project,docs,setDocs,t,lang,user}){
               <span style={{fontSize:11,color:"var(--ink3)",fontFamily:"var(--fm)"}}>{fmtD(doc.uploaded_at||doc.uploadedAt)}</span>
               <Badge type={doc.status==="analyzed"?"analyzed":"analyzing"} label={doc.status==="analyzed"?"Analyzed":"Analyzing…"}/>
               {doc.status==="analyzed"&&<button className="btn btn-g btn-sm" onClick={()=>accAll(doc.id)}>{t.acceptAll}</button>}
+              {doc.status==="analyzed"&&IS_CONFIGURED&&<button className="btn btn-g btn-sm" onClick={()=>reanalyze(doc)} title="Re-run AI analysis">↻ Re-analyze</button>}
+              <button className="btn btn-g btn-sm" style={{color:"var(--red)"}} onClick={()=>deleteDoc(doc)} title="Delete document">✕</button>
             </div>
             {doc.status==="analyzing"||analyzing===doc.id
               ?<div className="ai-sp"><div className="ai-d"/><div className="ai-d"/><div className="ai-d"/><span>{t.analyzing}</span></div>
