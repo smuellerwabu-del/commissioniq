@@ -257,7 +257,20 @@ hr.dv{border:none;border-top:1px solid var(--rule);margin:20px 0}
 </head>
 <body>
 <div id="root"></div>
-<script type="text/babel">
+<div id="load-error" style="display:none;font-family:system-ui,sans-serif;padding:40px;text-align:center;color:#B84040">
+  <div style="font-size:32px;margin-bottom:16px">⚠</div>
+  <div style="font-size:18px;font-weight:600;margin-bottom:8px">CommissionIQ konnte nicht geladen werden</div>
+  <div style="font-size:14px;color:#4A5568">Bitte Cache leeren: Strg+Shift+R (Windows) oder Cmd+Shift+R (Mac)</div>
+</div>
+<script>
+// Show error if React doesn't start within 8 seconds
+setTimeout(function(){
+  if(!document.querySelector('#root > *')){
+    document.getElementById('load-error').style.display='block';
+  }
+},8000);
+</script>
+<script type="text/babel" data-presets="react">
 const {useState,useRef,useEffect,useCallback}=React;
 
 // ── SUPABASE CONFIG ───────────────────────────────────────────────────────────
